@@ -1,0 +1,11 @@
+.env
+*.env
+google_credentials.json
+jobs_database.db
+generated_cvs/
+reports/
+logs/
+*.log
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,117 @@
+name: BioChem Daily Job Pipeline
+
+on:
+  schedule:
+    - cron: '0 7 * * *'    # 7am UTC daily
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run'
+        required: false
+        default: '--auto'
+        type: choice
+        options: ['--auto', '--test-llm', '--report', '--train']
+
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Write Google credentials BEFORE pipeline runs
+      - name: Write Google credentials
+        run: |
+          CREDS='${{ secrets.GOOGLE_CREDENTIALS_JSON }}'
+          if [ -n "$CREDS" ] && [ "$CREDS" != "" ]; then
+            echo "$CREDS" > google_credentials.json
+            echo "✅ Google credentials written"
+          else
+            echo "⚠️  No Google credentials — Sheets sync skipped"
+          fi
+
+      # Restore database from previous run
+      - name: Restore database
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh release list --limit 20 --json tagName \
+            -q '[.[] | select(.tagName | startswith("biochem-db"))][0].tagName' \
+            2>/dev/null || echo "")
+          if [ -n "$LATEST" ]; then
+            gh release download "$LATEST" --pattern "jobs_database.db" \
+              --output jobs_database.db 2>/dev/null && \
+              echo "✅ DB restored from $LATEST" || \
+              echo "⚠️  No DB backup — starting fresh"
+          else
+            echo "⚠️  No backups yet — fresh start"
+          fi
+
+      - name: Run pipeline
+        env:
+          GROQ_API_KEY:             ${{ secrets.GROQ_API_KEY }}
+          LLM_BACKEND:              ${{ secrets.LLM_BACKEND }}
+          GROQ_MODEL:               ${{ secrets.GROQ_MODEL }}
+          GMAIL_ADDRESS:            ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASS:           ${{ secrets.GMAIL_APP_PASS }}
+          GOOGLE_SHEET_NAME:        ${{ secrets.GOOGLE_SHEET_NAME }}
+          GOOGLE_CREDENTIALS_FILE:  google_credentials.json
+          MATCH_SCORE_THRESHOLD:    "60"
+          MAX_JOBS_PER_RUN:         "100"
+        run: |
+          CMD="${{ github.event.inputs.command }}"
+          python main.py "${CMD:---auto}"
+
+      # Save database backup
+      - name: Save database backup
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "jobs_database.db" ] && [ -s "jobs_database.db" ]; then
+            TAG="biochem-db-$(date +%Y%m%d-%H%M%S)"
+            JOBS=$(python3 -c "
+import sqlite3
+try:
+    c=sqlite3.connect('jobs_database.db')
+    n=c.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
+    applied=c.execute('SELECT COUNT(*) FROM jobs WHERE applied=1').fetchone()[0]
+    print(f'{n} jobs / {applied} applied')
+    c.close()
+except: print('unknown')
+" 2>/dev/null || echo "unknown")
+            gh release create "$TAG" jobs_database.db \
+              --title "DB $(date '+%Y-%m-%d') — ${JOBS}" \
+              --notes "Auto backup: ${JOBS}" \
+              --prerelease 2>/dev/null && \
+              echo "✅ DB backed up: $TAG" || \
+              echo "⚠️  Backup failed"
+            # Keep only 14 most recent backups
+            gh release list --limit 50 --json tagName \
+              -q '[.[] | select(.tagName | startswith("biochem-db"))][14:][].tagName' \
+              2>/dev/null | xargs -I{} gh release delete {} --yes 2>/dev/null || true
+          fi
+
+      # Upload generated CVs as downloadable artifacts
+      - name: Upload generated CVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-cvs-${{ github.run_number }}
+          path: generated_cvs/
+          retention-days: 14
+          if-no-files-found: ignore
